@@ -1,0 +1,1207 @@
+use std::{
+    env, fmt, fs, io,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use figment::{
+    Figment,
+    providers::{Env, Format, Serialized, Toml},
+};
+use serde::{Deserialize, Deserializer, Serialize};
+use windwatcher::{
+    Hs256JwtAccessTokenCodec, Hs256SigningSecret, JobPolicy, MessagePolicy, MySqlQueueOptions,
+    MySqlStorageOptions, PostgresQueueOptions, PostgresStorageOptions, RedisQueueOptions,
+    RegistrationPolicy, SessionPolicy, SqliteQueueOptions, SqliteStorageOptions,
+};
+
+use crate::{cli::LogFormat, error::AppError, paths::ResolvedPaths};
+
+pub(crate) mod http;
+pub(crate) mod realtime;
+pub(crate) mod server;
+use http::RawHttp;
+use realtime::RawRealtime;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DurationValue(String);
+impl DurationValue {
+    fn parse(&self) -> Result<Duration, AppError> {
+        humantime::parse_duration(&self.0)
+            .map_err(|error| AppError::Config(format!("invalid duration {:?}: {error}", self.0)))
+    }
+}
+impl<'de> Deserialize<'de> for DurationValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        humantime::parse_duration(&value).map_err(serde::de::Error::custom)?;
+        Ok(Self(value))
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RawConfig {
+    pub storage: RawStorage,
+    pub queue: Option<RawQueue>,
+    pub auth: RawAuth,
+    pub messages: RawMessages,
+    pub server: server::RawServer,
+    pub http: RawHttp,
+    pub realtime: RawRealtime,
+    pub logging: RawLogging,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RawQueue {
+    pub provider: String,
+    pub concurrency: usize,
+    pub lease_duration: DurationValue,
+    pub lease_renew_interval: DurationValue,
+    pub poll_interval: DurationValue,
+    pub default_max_attempts: u32,
+    pub retry_base_delay: DurationValue,
+    pub retry_max_delay: DurationValue,
+    pub max_payload_bytes: usize,
+    pub completed_retention: DurationValue,
+    pub maintenance_interval: DurationValue,
+    pub shutdown_grace_period: DurationValue,
+    pub sqlite: RawQueueSqlite,
+    pub postgres: RawQueueSqlNetwork,
+    pub mysql: RawQueueSqlNetwork,
+    pub redis: RawQueueRedis,
+}
+impl Default for RawQueue {
+    fn default() -> Self {
+        Self {
+            provider: "sqlite".into(),
+            concurrency: 1,
+            lease_duration: DurationValue("60s".into()),
+            lease_renew_interval: DurationValue("20s".into()),
+            poll_interval: DurationValue("1s".into()),
+            default_max_attempts: 5,
+            retry_base_delay: DurationValue("1s".into()),
+            retry_max_delay: DurationValue("5m".into()),
+            max_payload_bytes: 262_144,
+            completed_retention: DurationValue("7d".into()),
+            maintenance_interval: DurationValue("5m".into()),
+            shutdown_grace_period: DurationValue("30s".into()),
+            sqlite: RawQueueSqlite::default(),
+            postgres: RawQueueSqlNetwork::default(),
+            mysql: RawQueueSqlNetwork::default(),
+            redis: RawQueueRedis::default(),
+        }
+    }
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RawQueueSqlite {
+    pub path: Option<PathBuf>,
+    pub create_if_missing: Option<bool>,
+    pub max_connections: Option<u32>,
+    pub busy_timeout: Option<String>,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RawQueueSqlNetwork {
+    pub url: Option<String>,
+    pub max_connections: Option<u32>,
+    pub acquire_timeout: Option<String>,
+}
+impl fmt::Debug for RawQueueSqlNetwork {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RawQueueSqlNetwork").finish_non_exhaustive()
+    }
+}
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RawQueueRedis {
+    pub url: Option<String>,
+    pub key_prefix: Option<String>,
+}
+impl fmt::Debug for RawQueueRedis {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RawQueueRedis").finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum ResolvedQueueProvider {
+    Sqlite {
+        options: SqliteQueueOptions,
+        create_if_missing: bool,
+        derived_path: bool,
+    },
+    Postgres(PostgresQueueOptions),
+    MySql(MySqlQueueOptions),
+    Redis(RedisQueueOptions),
+}
+impl ResolvedQueueProvider {
+    pub fn backend_name(&self) -> &'static str {
+        match self {
+            Self::Sqlite { .. } => "SQLite",
+            Self::Postgres(_) => "PostgreSQL",
+            Self::MySql(_) => "MySQL",
+            Self::Redis(_) => "Redis",
+        }
+    }
+    pub fn needs_data_directory(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlite {
+                derived_path: true,
+                create_if_missing: true,
+                ..
+            }
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvedQueueConfig {
+    pub job_policy: JobPolicy,
+    pub concurrency: usize,
+    pub lease_duration: Duration,
+    pub lease_renew_interval: Duration,
+    pub poll_interval: Duration,
+    pub retry_base_delay: Duration,
+    pub retry_max_delay: Duration,
+    pub completed_retention: Duration,
+    pub maintenance_interval: Duration,
+    pub shutdown_grace_period: Duration,
+    pub provider: ResolvedQueueProvider,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RawStorage {
+    pub provider: String,
+    pub sqlite: Option<RawSqlite>,
+    pub postgres: RawQueueSqlNetwork,
+    pub mysql: RawQueueSqlNetwork,
+    pub mongodb: RawMongoStorage,
+}
+impl Default for RawStorage {
+    fn default() -> Self {
+        Self {
+            provider: "sqlite".into(),
+            sqlite: None,
+            postgres: RawQueueSqlNetwork::default(),
+            mysql: RawQueueSqlNetwork::default(),
+            mongodb: RawMongoStorage::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum ResolvedStorageProvider {
+    Sqlite {
+        options: SqliteStorageOptions,
+        derived_path: bool,
+        create_if_missing: bool,
+    },
+    Postgres(PostgresStorageOptions),
+    MySql(MySqlStorageOptions),
+    MongoDb(windwatcher::MongoDbStorageOptions),
+}
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RawMongoStorage {
+    pub url: Option<String>,
+    pub database: Option<String>,
+}
+impl fmt::Debug for RawMongoStorage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RawMongoStorage")
+            .field("url", &self.url.as_ref().map(|_| "[REDACTED]"))
+            .field("database", &self.database)
+            .finish()
+    }
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RawMessages {
+    pub max_content_bytes: usize,
+}
+impl Default for RawMessages {
+    fn default() -> Self {
+        Self {
+            max_content_bytes: MessagePolicy::default().max_content_bytes(),
+        }
+    }
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RawSqlite {
+    pub url: Option<String>,
+    pub create_if_missing: Option<bool>,
+    pub max_connections: Option<u32>,
+    pub busy_timeout: Option<DurationValue>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RawAuth {
+    pub registration: String,
+    pub session: RawSession,
+    pub jwt: RawJwt,
+}
+impl Default for RawAuth {
+    fn default() -> Self {
+        Self {
+            registration: "closed".into(),
+            session: RawSession::default(),
+            jwt: RawJwt::default(),
+        }
+    }
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RawSession {
+    pub access_token_ttl: DurationValue,
+    pub session_ttl: DurationValue,
+}
+impl Default for RawSession {
+    fn default() -> Self {
+        Self {
+            access_token_ttl: DurationValue("15m".into()),
+            session_ttl: DurationValue("30d".into()),
+        }
+    }
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RawJwt {
+    pub issuer: String,
+    pub secret: Option<String>,
+    pub secret_file: Option<PathBuf>,
+}
+
+struct EnvJwtOverride {
+    secret: Option<String>,
+    secret_file: Option<PathBuf>,
+}
+impl fmt::Debug for RawJwt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RawJwt")
+            .field("issuer", &self.issuer)
+            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
+            .field("secret_file", &self.secret_file)
+            .finish()
+    }
+}
+impl Default for RawJwt {
+    fn default() -> Self {
+        Self {
+            issuer: "windwatcher".into(),
+            secret: None,
+            secret_file: None,
+        }
+    }
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RawLogging {
+    pub filter: String,
+    pub format: LogFormat,
+}
+impl Default for RawLogging {
+    fn default() -> Self {
+        Self {
+            filter: "info".into(),
+            format: LogFormat::Compact,
+        }
+    }
+}
+
+pub fn load(paths: &ResolvedPaths, explicit: Option<PathBuf>) -> Result<RawConfig, AppError> {
+    let is_explicit = explicit.is_some();
+    let config_file = explicit.unwrap_or_else(|| paths.config_file.clone());
+    let config_file = discover_config_file(&config_file, is_explicit)?;
+    let mut figment = Figment::from(Serialized::defaults(RawConfig::default()));
+    if let Some(config_file) = config_file {
+        figment = figment.merge(Toml::file(config_file));
+    }
+    let mut raw: RawConfig = figment
+        .merge(
+            Env::prefixed("WINDWATCHER__")
+                .filter(|key| {
+                    !key.as_str().eq_ignore_ascii_case("AUTH__JWT__SECRET")
+                        && !key.as_str().eq_ignore_ascii_case("AUTH__JWT__SECRET_FILE")
+                })
+                .split("__"),
+        )
+        .extract()
+        .map_err(|error| AppError::Config(error.to_string()))?;
+    if let Some(override_) = environment_jwt_override()? {
+        raw.auth.jwt.secret = override_.secret;
+        raw.auth.jwt.secret_file = override_.secret_file;
+    }
+    Ok(raw)
+}
+
+pub(crate) fn show(
+    raw: &RawConfig,
+    filter: Option<&str>,
+    format: Option<LogFormat>,
+) -> Result<String, AppError> {
+    let mut safe = raw.clone();
+    let redact = |value: &mut Option<String>| {
+        if value.is_some() {
+            *value = Some("<redacted>".into());
+        }
+    };
+    redact(&mut safe.auth.jwt.secret);
+    if let Some(sqlite) = &mut safe.storage.sqlite {
+        redact(&mut sqlite.url);
+    }
+    redact(&mut safe.storage.postgres.url);
+    redact(&mut safe.storage.mysql.url);
+    redact(&mut safe.storage.mongodb.url);
+    if let Some(queue) = &mut safe.queue {
+        redact(&mut queue.postgres.url);
+        redact(&mut queue.mysql.url);
+        redact(&mut queue.redis.url);
+    }
+    if let Some(filter) = filter {
+        safe.logging.filter = filter.into();
+    }
+    if let Some(format) = format {
+        safe.logging.format = format;
+    }
+    toml::to_string_pretty(&safe)
+        .map_err(|_| AppError::Config("failed to display configuration".into()))
+}
+
+fn discover_config_file(path: &Path, explicit: bool) -> Result<Option<PathBuf>, AppError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => match fs::metadata(path) {
+            Ok(target) if target.is_file() => Ok(Some(path.to_path_buf())),
+            Ok(_) => Err(AppError::Config(format!(
+                "configuration path {} is not a regular file",
+                path.display()
+            ))),
+            Err(error) => Err(AppError::Config(format!(
+                "failed to inspect configuration file {}: {error}",
+                path.display()
+            ))),
+        },
+        Ok(metadata) if metadata.is_file() => Ok(Some(path.to_path_buf())),
+        Ok(_) => Err(AppError::Config(format!(
+            "configuration path {} is not a regular file",
+            path.display()
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound && !explicit => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(AppError::Config(format!(
+            "configuration file {} does not exist",
+            path.display()
+        ))),
+        Err(error) => Err(AppError::Config(format!(
+            "failed to inspect configuration file {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn environment_jwt_override() -> Result<Option<EnvJwtOverride>, AppError> {
+    let secret = environment_utf8("WINDWATCHER__AUTH__JWT__SECRET")?;
+    let secret_file = environment_utf8("WINDWATCHER__AUTH__JWT__SECRET_FILE")?;
+    match (secret, secret_file) {
+        (Some(secret), secret_file) => Ok(Some(EnvJwtOverride {
+            secret: Some(secret),
+            secret_file: secret_file.map(PathBuf::from),
+        })),
+        (None, Some(path)) => Ok(Some(EnvJwtOverride {
+            secret: None,
+            secret_file: Some(PathBuf::from(path)),
+        })),
+        (None, None) => Ok(None),
+    }
+}
+
+fn environment_utf8(key: &str) -> Result<Option<String>, AppError> {
+    match env::var(key) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => Err(AppError::Config(format!(
+            "environment variable {key} must be valid UTF-8"
+        ))),
+    }
+}
+
+pub fn resolve_sqlite(
+    raw: &RawConfig,
+    paths: &ResolvedPaths,
+) -> Result<(SqliteStorageOptions, bool, bool), AppError> {
+    let config = raw.storage.sqlite.as_ref();
+    let derived = config.and_then(|sqlite| sqlite.url.as_ref()).is_none();
+    let location = config
+        .and_then(|sqlite| sqlite.url.clone())
+        .unwrap_or_else(|| paths.data_dir.join("windwatcher.db").display().to_string());
+    let mut options = SqliteStorageOptions::new(location);
+    if let Some(sqlite) = config {
+        if let Some(value) = sqlite.create_if_missing {
+            options = options.create_if_missing(value);
+        }
+        if let Some(value) = sqlite.max_connections {
+            if value == 0 {
+                return Err(AppError::Config(
+                    "storage.sqlite.max_connections must be greater than zero".into(),
+                ));
+            }
+            options = options.max_connections(value);
+        }
+        if let Some(value) = &sqlite.busy_timeout {
+            let value = value.parse()?;
+            if value.is_zero() {
+                return Err(AppError::Config(
+                    "storage.sqlite.busy_timeout must be greater than zero".into(),
+                ));
+            }
+            options = options.busy_timeout(value);
+        }
+    }
+    let create_if_missing = config
+        .and_then(|sqlite| sqlite.create_if_missing)
+        .unwrap_or(true);
+    options
+        .validate()
+        .map_err(|error| AppError::Config(error.to_string()))?;
+    Ok((options, derived, create_if_missing))
+}
+
+pub fn resolve_storage(
+    raw: &RawConfig,
+    paths: &ResolvedPaths,
+) -> Result<ResolvedStorageProvider, AppError> {
+    match raw.storage.provider.as_str() {
+        "sqlite" => {
+            let (options, derived_path, create_if_missing) = resolve_sqlite(raw, paths)?;
+            Ok(ResolvedStorageProvider::Sqlite {
+                options,
+                derived_path,
+                create_if_missing,
+            })
+        }
+        "mongodb" => {
+            let url = raw
+                .storage
+                .mongodb
+                .url
+                .as_deref()
+                .ok_or_else(|| AppError::Config("storage.mongodb.url is required".into()))?;
+            let database =
+                raw.storage.mongodb.database.as_deref().ok_or_else(|| {
+                    AppError::Config("storage.mongodb.database is required".into())
+                })?;
+            let options = windwatcher::MongoDbStorageOptions::new(url, database);
+            // MongoDB URL parsing is async; configuration resolution stays synchronous.
+            if url.trim().is_empty() || database.trim().is_empty() {
+                return Err(AppError::Config(
+                    "storage.mongodb.url and database must be non-empty".into(),
+                ));
+            }
+            Ok(ResolvedStorageProvider::MongoDb(options))
+        }
+        "postgres" | "mysql" => {
+            let (url, max_connections, timeout) = if raw.storage.provider == "postgres" {
+                (
+                    &raw.storage.postgres.url,
+                    raw.storage.postgres.max_connections,
+                    &raw.storage.postgres.acquire_timeout,
+                )
+            } else {
+                (
+                    &raw.storage.mysql.url,
+                    raw.storage.mysql.max_connections,
+                    &raw.storage.mysql.acquire_timeout,
+                )
+            };
+            let url = url.as_deref().ok_or_else(|| {
+                AppError::Config(format!("storage.{}.url is required", raw.storage.provider))
+            })?;
+            if max_connections == Some(0) {
+                return Err(AppError::Config(format!(
+                    "storage.{}.max_connections must be greater than zero",
+                    raw.storage.provider
+                )));
+            }
+            let timeout = timeout
+                .as_deref()
+                .map(humantime::parse_duration)
+                .transpose()
+                .map_err(|e| {
+                    AppError::Config(format!(
+                        "invalid storage.{}.acquire_timeout: {e}",
+                        raw.storage.provider
+                    ))
+                })?;
+            if timeout.is_some_and(|v| v.is_zero()) {
+                return Err(AppError::Config(format!(
+                    "storage.{}.acquire_timeout must be greater than zero",
+                    raw.storage.provider
+                )));
+            }
+            if raw.storage.provider == "postgres" {
+                let mut options = PostgresStorageOptions::new(url);
+                if let Some(n) = max_connections {
+                    options = options.max_connections(n);
+                }
+                if let Some(t) = timeout {
+                    options = options.acquire_timeout(t);
+                }
+                options
+                    .validate()
+                    .map_err(|e| AppError::Config(e.to_string()))?;
+                Ok(ResolvedStorageProvider::Postgres(options))
+            } else {
+                let mut options = MySqlStorageOptions::new(url);
+                if let Some(n) = max_connections {
+                    options = options.max_connections(n);
+                }
+                if let Some(t) = timeout {
+                    options = options.acquire_timeout(t);
+                }
+                options
+                    .validate()
+                    .map_err(|e| AppError::Config(e.to_string()))?;
+                Ok(ResolvedStorageProvider::MySql(options))
+            }
+        }
+        _ => Err(AppError::Config(
+            "storage.provider must be `sqlite`, `postgres`, `mysql` or `mongodb`".into(),
+        )),
+    }
+}
+
+pub fn resolve_registration(raw: &RawConfig) -> Result<RegistrationPolicy, AppError> {
+    match raw.auth.registration.as_str() {
+        "open" => Ok(RegistrationPolicy::Open),
+        "closed" => Ok(RegistrationPolicy::Closed),
+        _ => Err(AppError::Config(
+            "auth.registration must be `open` or `closed`".into(),
+        )),
+    }
+}
+pub fn resolve_session(raw: &RawConfig) -> Result<SessionPolicy, AppError> {
+    let access = time::Duration::try_from(raw.auth.session.access_token_ttl.parse()?)
+        .map_err(|_| AppError::Config("access token duration is out of range".into()))?;
+    let session = time::Duration::try_from(raw.auth.session.session_ttl.parse()?)
+        .map_err(|_| AppError::Config("session duration is out of range".into()))?;
+    SessionPolicy::new(access, session).map_err(|error| AppError::Config(error.to_string()))
+}
+pub fn resolve_jwt(raw: &RawConfig) -> Result<Hs256JwtAccessTokenCodec, AppError> {
+    if raw.auth.jwt.issuer.is_empty() {
+        return Err(AppError::Config("auth.jwt.issuer must not be empty".into()));
+    }
+    let bytes = match (&raw.auth.jwt.secret, &raw.auth.jwt.secret_file) {
+        (Some(_), Some(_)) => {
+            return Err(AppError::Config(
+                "auth.jwt.secret and auth.jwt.secret_file are mutually exclusive".into(),
+            ));
+        }
+        (Some(secret), None) => secret.as_bytes().to_vec(),
+        (None, Some(path)) => fs::read(path).map_err(|error| {
+            AppError::Config(format!(
+                "failed to read JWT secret file {}: {error}",
+                path.display()
+            ))
+        })?,
+        (None, None) => return Err(AppError::Config("JWT signing secret is required".into())),
+    };
+    let secret =
+        Hs256SigningSecret::new(bytes).map_err(|error| AppError::Config(error.to_string()))?;
+    Ok(Hs256JwtAccessTokenCodec::new(
+        secret,
+        raw.auth.jwt.issuer.clone(),
+    ))
+}
+
+pub(crate) struct ResolvedServeConfig {
+    pub server: server::ResolvedServerConfig,
+    pub storage: ResolvedStorageProvider,
+    pub registration: RegistrationPolicy,
+    pub session: SessionPolicy,
+    pub http: http::ResolvedHttpConfig,
+    pub realtime: realtime::ResolvedRealtimeConfig,
+    pub messages: MessagePolicy,
+    pub jwt: Hs256JwtAccessTokenCodec,
+}
+
+pub fn resolve_serve(
+    raw: &RawConfig,
+    paths: &ResolvedPaths,
+) -> Result<ResolvedServeConfig, AppError> {
+    Ok(ResolvedServeConfig {
+        server: raw.server.resolve()?,
+        storage: resolve_storage(raw, paths)?,
+        registration: resolve_registration(raw)?,
+        session: resolve_session(raw)?,
+        http: raw.http.resolve().map_err(AppError::Config)?,
+        realtime: raw.realtime.resolve().map_err(AppError::Config)?,
+        messages: resolve_messages(raw),
+        jwt: resolve_jwt(raw)?,
+    })
+}
+
+pub fn resolve_full(raw: &RawConfig, paths: &ResolvedPaths) -> Result<(), AppError> {
+    resolve_serve(raw, paths)?;
+    if raw.queue.is_some() {
+        resolve_queue(raw, paths)?;
+    }
+    Ok(())
+}
+
+/// Syntax-only asynchronous validation; never opens a database connection.
+pub async fn validate_full(raw: &RawConfig, paths: &ResolvedPaths) -> Result<(), AppError> {
+    resolve_full(raw, paths)?;
+    if let ResolvedStorageProvider::MongoDb(options) = resolve_storage(raw, paths)? {
+        options
+            .validate()
+            .await
+            .map_err(|error| AppError::Config(error.to_string()))?;
+    }
+    Ok(())
+}
+
+pub fn resolve_queue(
+    raw: &RawConfig,
+    paths: &ResolvedPaths,
+) -> Result<ResolvedQueueConfig, AppError> {
+    let Some(queue) = raw.queue.as_ref() else {
+        return Err(AppError::Config(
+            "queue is not configured; add a [queue] section".into(),
+        ));
+    };
+    if !["sqlite", "postgres", "mysql", "redis"].contains(&queue.provider.as_str()) {
+        return Err(AppError::Config(
+            "queue.provider must be `sqlite`, `postgres`, `mysql` or `redis`".into(),
+        ));
+    }
+    let lease_duration = queue.lease_duration.parse()?;
+    let lease_renew_interval = queue.lease_renew_interval.parse()?;
+    let poll_interval = queue.poll_interval.parse()?;
+    let retry_base_delay = queue.retry_base_delay.parse()?;
+    let retry_max_delay = queue.retry_max_delay.parse()?;
+    let completed_retention = queue.completed_retention.parse()?;
+    let maintenance_interval = queue.maintenance_interval.parse()?;
+    let shutdown_grace_period = queue.shutdown_grace_period.parse()?;
+    let job_policy = JobPolicy::new(queue.max_payload_bytes, queue.default_max_attempts)
+        .map_err(|error| AppError::Config(format!("queue: {error}")))?;
+    windwatcher::JobLease::expiration(time::OffsetDateTime::now_utc(), lease_duration)
+        .map_err(|error| AppError::Config(format!("queue.lease_duration: {error}")))?;
+    if queue.concurrency == 0
+        || lease_duration.is_zero()
+        || lease_renew_interval.is_zero()
+        || lease_renew_interval >= lease_duration
+        || poll_interval.is_zero()
+        || retry_base_delay.is_zero()
+        || retry_max_delay < retry_base_delay
+        || completed_retention.is_zero()
+        || maintenance_interval.is_zero()
+        || shutdown_grace_period.is_zero()
+    {
+        return Err(AppError::Config("queue durations, concurrency, payload limit and attempts must be positive; lease_renew_interval must be less than lease_duration and retry_max_delay must be at least retry_base_delay".into()));
+    }
+    for duration in [
+        lease_duration,
+        lease_renew_interval,
+        poll_interval,
+        retry_base_delay,
+        retry_max_delay,
+        completed_retention,
+        maintenance_interval,
+        shutdown_grace_period,
+    ] {
+        if time::Duration::try_from(duration).is_err() {
+            return Err(AppError::Config(
+                "queue duration exceeds the supported timestamp range".into(),
+            ));
+        }
+    }
+    let provider = match queue.provider.as_str() {
+        "postgres" | "mysql" => {
+            let block = if queue.provider == "postgres" {
+                &queue.postgres
+            } else {
+                &queue.mysql
+            };
+            let field = if queue.provider == "postgres" {
+                "queue.postgres"
+            } else {
+                "queue.mysql"
+            };
+            let url = block
+                .url
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| AppError::Config(format!("{field}.url is required")))?;
+            let connections = block.max_connections.unwrap_or(8);
+            if connections == 0 {
+                return Err(AppError::Config(format!(
+                    "{field}.max_connections must be greater than zero"
+                )));
+            }
+            let timeout =
+                humantime::parse_duration(block.acquire_timeout.as_deref().unwrap_or("5s"))
+                    .map_err(|_| {
+                        AppError::Config(format!(
+                            "{field}.acquire_timeout must be a valid duration"
+                        ))
+                    })?;
+            if timeout.is_zero() || std::time::Instant::now().checked_add(timeout).is_none() {
+                return Err(AppError::Config(format!(
+                    "{field}.acquire_timeout must be greater than zero"
+                )));
+            }
+            if queue.provider == "postgres" {
+                let options = PostgresQueueOptions::new(url)
+                    .max_connections(connections)
+                    .acquire_timeout(timeout);
+                options.validate().map_err(|_| {
+                    AppError::Config("queue.postgres.url must be a valid PostgreSQL URL".into())
+                })?;
+                ResolvedQueueProvider::Postgres(options)
+            } else {
+                let options = MySqlQueueOptions::new(url)
+                    .max_connections(connections)
+                    .acquire_timeout(timeout);
+                options.validate().map_err(|_| {
+                    AppError::Config("queue.mysql.url must be a valid MySQL URL".into())
+                })?;
+                ResolvedQueueProvider::MySql(options)
+            }
+        }
+        "redis" => {
+            let url = queue
+                .redis
+                .url
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| AppError::Config("queue.redis.url is required".into()))?;
+            let options = RedisQueueOptions::new(url);
+            options.validate().map_err(|_| {
+                AppError::Config("queue.redis.url must be a valid Redis URL".into())
+            })?;
+            let options = options.key_prefix(
+                queue
+                    .redis
+                    .key_prefix
+                    .as_deref()
+                    .unwrap_or("windwatcher:queue"),
+            );
+            options.validate().map_err(|_| {
+                AppError::Config(
+                    "queue.redis.key_prefix must contain 1..=256 bytes without controls".into(),
+                )
+            })?;
+            ResolvedQueueProvider::Redis(options)
+        }
+        _ => {
+            let derived_path = queue.sqlite.path.is_none();
+            let path = queue
+                .sqlite
+                .path
+                .clone()
+                .unwrap_or_else(|| paths.data_dir.join("queue.db"));
+            let storage_location = raw
+                .storage
+                .sqlite
+                .as_ref()
+                .and_then(|s| s.url.as_deref())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| paths.data_dir.join("windwatcher.db"));
+            if raw.storage.provider == "sqlite" && same_database_path(&path, &storage_location) {
+                return Err(AppError::Config("storage.sqlite and queue.sqlite resolve to the same database file; queue requires a separate database".into()));
+            }
+            let create_if_missing = queue.sqlite.create_if_missing.unwrap_or(true);
+            let mut options = SqliteQueueOptions::new(path.to_string_lossy().to_string())
+                .create_if_missing(create_if_missing);
+            if let Some(connections) = queue.sqlite.max_connections {
+                if connections == 0 {
+                    return Err(AppError::Config(
+                        "queue.sqlite.max_connections must be greater than zero".into(),
+                    ));
+                }
+                options = options.max_connections(connections);
+            }
+            if let Some(timeout) = &queue.sqlite.busy_timeout {
+                let timeout = humantime::parse_duration(timeout).map_err(|_| {
+                    AppError::Config("queue.sqlite.busy_timeout must be a valid duration".into())
+                })?;
+                if timeout.is_zero() {
+                    return Err(AppError::Config(
+                        "queue.sqlite.busy_timeout must be greater than zero".into(),
+                    ));
+                }
+                options = options.busy_timeout(timeout);
+            }
+            ResolvedQueueProvider::Sqlite {
+                options,
+                create_if_missing,
+                derived_path,
+            }
+        }
+    };
+    Ok(ResolvedQueueConfig {
+        job_policy,
+        concurrency: queue.concurrency,
+        lease_duration,
+        lease_renew_interval,
+        poll_interval,
+        retry_base_delay,
+        retry_max_delay,
+        completed_retention,
+        maintenance_interval,
+        shutdown_grace_period,
+        provider,
+    })
+}
+
+fn same_database_path(left: &Path, right: &Path) -> bool {
+    fn normalized(path: &Path) -> PathBuf {
+        let value = path.to_string_lossy();
+        let value = value
+            .strip_prefix("sqlite://")
+            .or_else(|| value.strip_prefix("sqlite:"))
+            .or_else(|| value.strip_prefix("file:"))
+            .unwrap_or(&value);
+        let value = value.split('?').next().unwrap_or(value);
+        let path = PathBuf::from(value);
+        if let Ok(canonical) = path.canonicalize() {
+            return canonical;
+        }
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf())
+            .join(path.file_name().unwrap_or_default())
+    }
+    normalized(left) == normalized(right)
+}
+
+pub fn resolve_messages(raw: &RawConfig) -> MessagePolicy {
+    MessagePolicy::new(raw.messages.max_content_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+    use windwatcher::{AccessTokenClaims, AccessTokenCodec, AccessTokenError, SessionId, UserId};
+
+    #[test]
+    fn message_config_resolves_library_policy_without_io_or_arbitrary_bounds() {
+        let raw = RawConfig::default();
+        assert_eq!(resolve_messages(&raw), MessagePolicy::default());
+        for maximum in [0, 4, 131_072, usize::MAX] {
+            let mut raw = RawConfig::default();
+            raw.messages.max_content_bytes = maximum;
+            assert_eq!(resolve_messages(&raw).max_content_bytes(), maximum);
+        }
+        let raw: RawConfig = Figment::from(Serialized::defaults(RawConfig::default()))
+            .merge(Toml::string("[messages]\nmax_content_bytes = 4"))
+            .extract()
+            .unwrap();
+        let policy = resolve_messages(&raw);
+        assert!(
+            policy
+                .validate(&windwatcher::MessageContent::new("😀").unwrap())
+                .is_ok()
+        );
+        assert!(
+            policy
+                .validate(&windwatcher::MessageContent::new("😀a").unwrap())
+                .is_err()
+        );
+        for invalid in [
+            "[messages]\nunknown = true",
+            "[messages]\nmax_content_bytes = -1",
+            "[messages]\nmax_content_bytes = 'four'",
+        ] {
+            assert!(
+                Figment::from(Serialized::defaults(RawConfig::default()))
+                    .merge(Toml::string(invalid))
+                    .extract::<RawConfig>()
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn jwt_secret_sources_are_exclusive_and_missing_secrets_are_rejected() {
+        let raw = RawConfig::default();
+        assert!(resolve_jwt(&raw).is_err());
+
+        let mut raw = RawConfig::default();
+        raw.auth.jwt.secret = Some("x".repeat(32));
+        raw.auth.jwt.secret_file = Some(PathBuf::from("unused"));
+        assert!(resolve_jwt(&raw).is_err());
+
+        let mut raw = RawConfig::default();
+        raw.auth.jwt.secret = Some("short".into());
+        assert!(resolve_jwt(&raw).is_err());
+
+        let mut raw = RawConfig::default();
+        raw.auth.jwt.secret_file = Some(PathBuf::from("missing-jwt-secret"));
+        assert!(resolve_jwt(&raw).is_err());
+    }
+
+    #[test]
+    fn jwt_secret_files_preserve_exact_bytes() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("jwt.key");
+        fs::write(&path, format!("{}\n", "x".repeat(32))).unwrap();
+        let mut raw = RawConfig::default();
+        raw.auth.jwt.secret_file = Some(path);
+        let codec = resolve_jwt(&raw).unwrap();
+        let now = time::OffsetDateTime::from_unix_timestamp(1).unwrap();
+        let claims = AccessTokenClaims::new(
+            UserId::new(),
+            SessionId::new(),
+            now,
+            now + time::Duration::seconds(1),
+        )
+        .unwrap();
+        let token = codec.issue(&claims).unwrap();
+        let without_newline = Hs256JwtAccessTokenCodec::new(
+            Hs256SigningSecret::new(vec![b'x'; 32]).unwrap(),
+            "windwatcher".into(),
+        );
+        assert!(matches!(
+            without_newline.verify(&token, now),
+            Err(AccessTokenError::InvalidToken)
+        ));
+    }
+
+    #[test]
+    fn jwt_debug_output_never_contains_a_direct_secret() {
+        let mut raw = RawConfig::default();
+        raw.auth.jwt.secret = Some("super-secret-value".into());
+        assert!(!format!("{raw:?}").contains("super-secret-value"));
+    }
+
+    #[test]
+    fn semantic_auth_errors_are_separate_from_storage_resolution() {
+        let mut raw = RawConfig::default();
+        raw.auth.session.access_token_ttl = DurationValue("500ms".into());
+        let paths = ResolvedPaths {
+            config_file: PathBuf::from("unused"),
+            data_dir: PathBuf::from("unused"),
+        };
+        assert!(resolve_sqlite(&raw, &paths).is_ok());
+        assert!(resolve_session(&raw).is_err());
+    }
+
+    #[test]
+    fn queue_configuration_is_optional_separate_and_validated() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let paths = ResolvedPaths {
+            config_file: PathBuf::from("unused"),
+            data_dir: directory.path().to_path_buf(),
+        };
+        let mut raw = RawConfig::default();
+        assert!(resolve_queue(&raw, &paths).is_err());
+        raw.queue = Some(RawQueue::default());
+        raw.queue.as_mut().unwrap().default_max_attempts = 20;
+        raw.queue.as_mut().unwrap().max_payload_bytes = 65_536;
+        let resolved = resolve_queue(&raw, &paths).unwrap();
+        assert_eq!(resolved.job_policy.default_max_attempts(), 20);
+        assert_eq!(resolved.job_policy.max_payload_bytes(), 65_536);
+        assert!(matches!(
+            resolved.provider,
+            ResolvedQueueProvider::Sqlite {
+                derived_path: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            directory.path().join("windwatcher.db"),
+            paths.data_dir.join("windwatcher.db")
+        );
+
+        raw.queue.as_mut().unwrap().lease_renew_interval = DurationValue("60s".into());
+        assert!(resolve_queue(&raw, &paths).is_err());
+        raw.queue.as_mut().unwrap().lease_renew_interval = DurationValue("20s".into());
+        raw.queue.as_mut().unwrap().lease_duration = DurationValue("999ns".into());
+        assert!(
+            resolve_queue(&raw, &paths)
+                .unwrap_err()
+                .to_string()
+                .contains("at least 1 microsecond")
+        );
+        raw.queue.as_mut().unwrap().lease_duration = DurationValue("60s".into());
+        raw.queue.as_mut().unwrap().sqlite.path = Some(paths.data_dir.join("windwatcher.db"));
+        assert!(resolve_queue(&raw, &paths).is_err());
+        // An inactive SQLite storage block must not conflict with the queue file.
+        raw.storage.provider = "postgres".into();
+        assert!(resolve_queue(&raw, &paths).is_ok());
+    }
+
+    #[test]
+    fn network_queue_config_is_selected_common_and_redacted() {
+        let paths = ResolvedPaths {
+            config_file: "unused".into(),
+            data_dir: "unused".into(),
+        };
+        let secret = "recognizable_fake_password";
+        for (provider, scheme, label) in [
+            ("postgres", "postgresql", "PostgreSQL"),
+            ("mysql", "mysql", "MySQL"),
+            ("redis", "redis", "Redis"),
+        ] {
+            let mut queue = RawQueue {
+                provider: provider.into(),
+                default_max_attempts: 20,
+                max_payload_bytes: 65_536,
+                ..RawQueue::default()
+            };
+            let mut raw = RawConfig {
+                queue: Some(queue.clone()),
+                ..RawConfig::default()
+            };
+            assert!(
+                resolve_queue(&raw, &paths)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(&format!("queue.{provider}.url"))
+            );
+            let url = format!("{scheme}://user:{secret}@localhost/0");
+            match provider {
+                "postgres" => queue.postgres.url = Some(url),
+                "mysql" => queue.mysql.url = Some(url),
+                _ => queue.redis.url = Some(url),
+            }
+            raw.queue = Some(queue.clone());
+            let resolved = resolve_queue(&raw, &paths).unwrap();
+            assert_eq!(resolved.provider.backend_name(), label);
+            assert!(!resolved.provider.needs_data_directory());
+            assert_eq!(resolved.job_policy.default_max_attempts(), 20);
+            assert_eq!(resolved.job_policy.max_payload_bytes(), 65_536);
+            assert!(!format!("{raw:?} {resolved:?}").contains(secret));
+            if provider != "redis" {
+                let selected = if provider == "postgres" {
+                    &mut queue.postgres
+                } else {
+                    &mut queue.mysql
+                };
+                selected.max_connections = Some(0);
+                raw.queue = Some(queue.clone());
+                assert!(resolve_queue(&raw, &paths).is_err());
+                let selected = if provider == "postgres" {
+                    &mut queue.postgres
+                } else {
+                    &mut queue.mysql
+                };
+                selected.max_connections = None;
+                selected.acquire_timeout = Some("0s".into());
+            } else {
+                queue.redis.key_prefix = Some(String::new());
+            }
+            raw.queue = Some(queue);
+            let error = resolve_queue(&raw, &paths).unwrap_err();
+            assert!(!format!("{error:?} {error}").contains(secret));
+        }
+        let queue = RawQueue {
+            postgres: RawQueueSqlNetwork {
+                url: Some(secret.into()),
+                max_connections: Some(0),
+                acquire_timeout: Some("invalid".into()),
+            },
+            redis: RawQueueRedis {
+                key_prefix: Some(String::new()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut raw = RawConfig {
+            queue: Some(queue),
+            ..Default::default()
+        };
+        assert!(resolve_queue(&raw, &paths).is_ok());
+        raw.queue.as_mut().unwrap().provider = "unknown".into();
+        assert!(resolve_queue(&raw, &paths).is_err());
+        let raw: RawConfig = Figment::from(Toml::string("[queue]\nprovider='redis'\n[queue.redis]\nurl='redis://localhost/0'\n[queue.sqlite]\nbusy_timeout='not a duration'\nmax_connections=0\n[queue.postgres]\nacquire_timeout='also invalid'\n"))
+            .extract().unwrap();
+        assert!(
+            resolve_queue(&raw, &paths).is_ok(),
+            "unselected provider options must not be validated"
+        );
+    }
+
+    #[test]
+    fn storage_provider_selection_requires_and_redacts_network_urls() {
+        let paths = ResolvedPaths {
+            config_file: "unused".into(),
+            data_dir: "unused".into(),
+        };
+        let secret = "storage_fake_password";
+        for (provider, scheme) in [("postgres", "postgresql"), ("mysql", "mysql")] {
+            let mut raw = RawConfig::default();
+            raw.storage.provider = provider.into();
+            assert!(
+                resolve_storage(&raw, &paths)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(&format!("storage.{provider}.url"))
+            );
+            if provider == "postgres" {
+                raw.storage.postgres.url =
+                    Some(format!("{scheme}://user:{secret}@localhost/windwatcher"));
+            } else {
+                raw.storage.mysql.url =
+                    Some(format!("{scheme}://user:{secret}@localhost/windwatcher"));
+            }
+            let resolved = resolve_storage(&raw, &paths).unwrap();
+            assert!(!format!("{raw:?} {resolved:?}").contains(secret));
+            if provider == "postgres" {
+                raw.storage.postgres.max_connections = Some(0);
+            } else {
+                raw.storage.mysql.max_connections = Some(0);
+            }
+            assert!(resolve_storage(&raw, &paths).is_err());
+            if provider == "postgres" {
+                raw.storage.postgres.max_connections = None;
+                raw.storage.postgres.acquire_timeout = Some("0s".into());
+            } else {
+                raw.storage.mysql.max_connections = None;
+                raw.storage.mysql.acquire_timeout = Some("0s".into());
+            }
+            assert!(resolve_storage(&raw, &paths).is_err());
+        }
+        let mut raw = RawConfig::default();
+        raw.storage.provider = "mongodb".into();
+        assert!(
+            resolve_storage(&raw, &paths)
+                .unwrap_err()
+                .to_string()
+                .contains("storage.mongodb.url")
+        );
+        let secret = "mongo_fake_password";
+        raw.storage.mongodb.url =
+            Some(format!("mongodb://user:{secret}@localhost/?replicaSet=rs0"));
+        raw.storage.mongodb.database = Some("windwatcher".into());
+        let resolved = resolve_storage(&raw, &paths).unwrap();
+        assert!(!format!("{raw:?} {resolved:?}").contains(secret));
+        assert!(matches!(resolved, ResolvedStorageProvider::MongoDb(_)));
+        let mut raw = RawConfig::default();
+        raw.storage.provider = "unknown".into();
+        assert!(resolve_storage(&raw, &paths).is_err());
+    }
+
+    #[test]
+    fn default_config_must_be_absent_or_a_regular_file() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let missing = directory.path().join("missing.toml");
+        assert!(discover_config_file(&missing, false).unwrap().is_none());
+        assert!(discover_config_file(directory.path(), false).is_err());
+
+        let link = directory.path().join("broken.toml");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(directory.path().join("missing-target"), &link).unwrap();
+        #[cfg(unix)]
+        assert!(discover_config_file(&link, false).is_err());
+    }
+}

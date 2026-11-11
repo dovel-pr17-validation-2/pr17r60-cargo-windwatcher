@@ -1,0 +1,124 @@
+# Windwatcher configuration. Precedence: defaults < TOML < WINDWATCHER__... < CLI.
+
+# Primary persistence provider: sqlite, postgres, mysql, or mongodb. This is independent
+# from the optional queue.provider below.
+[storage]
+provider = "sqlite"
+
+[storage.sqlite]
+# Omit url for the mode-specific default database path.
+# url = "/var/lib/windwatcher/windwatcher.db"
+# Only applying migrations may create missing SQLite persistence.
+create_if_missing = true
+max_connections = 8
+busy_timeout = "5s"
+
+# For a dedicated, pre-created PostgreSQL or MySQL primary database, select the
+# provider above and configure only its corresponding block. Keep credentials in
+# environment/secret management rather than committed files.
+# [storage.postgres]
+# url = "postgresql://windwatcher:password@localhost/windwatcher"
+# max_connections = 8
+# acquire_timeout = "5s"
+#
+# [storage.mysql]
+# url = "mysql://windwatcher:password@localhost/windwatcher"
+# max_connections = 8
+# acquire_timeout = "5s"
+
+# Optional durable queue. SQL databases/migrations are separate from storage.
+# Remove this section to disable queue operations.
+[queue]
+provider = "sqlite"
+concurrency = 1
+lease_duration = "60s"
+lease_renew_interval = "20s"
+poll_interval = "1s"
+default_max_attempts = 5
+retry_base_delay = "1s"
+retry_max_delay = "5m"
+max_payload_bytes = 262144
+completed_retention = "7d"
+maintenance_interval = "5m"
+shutdown_grace_period = "30s"
+
+[queue.sqlite]
+# Omit path for the mode-specific queue.db next to windwatcher.db.
+# path = "/var/lib/windwatcher/queue.db"
+create_if_missing = true
+max_connections = 8
+busy_timeout = "5s"
+
+# To switch providers, change queue.provider above. Only the selected block is used.
+# PostgreSQL/MySQL URLs must target a dedicated, pre-created queue database.
+# Network credentials below are development placeholders; never commit real secrets.
+# [queue.postgres]
+# url = "postgresql://windwatcher:password@localhost/windwatcher_queue"
+# max_connections = 8
+# acquire_timeout = "5s"
+#
+# [queue.mysql]
+# url = "mysql://windwatcher:password@localhost/windwatcher_queue"
+# max_connections = 8
+# acquire_timeout = "5s"
+#
+# [queue.redis]
+# url = "redis://localhost/0"
+# key_prefix = "windwatcher:queue"
+# Redis needs durable persistence and a policy that does not evict queue keys.
+
+[auth]
+registration = "closed"
+
+[auth.session]
+access_token_ttl = "15m"
+session_ttl = "30d"
+
+[auth.jwt]
+issuer = "windwatcher"
+secret_file = "/etc/windwatcher/jwt.key"
+# secret = "replace-with-a-secret-at-least-32-bytes-long"
+
+[messages]
+# Inclusive UTF-8 byte limit for new sends/edits; 131072 bytes = 128 KiB.
+max_content_bytes = 131072
+
+[server]
+# Loopback is safe by default; explicitly use 0.0.0.0:8080 for container networking.
+bind = "127.0.0.1:8080"
+# One total HTTP + realtime drain budget.
+shutdown_grace_period = "30s"
+readiness_timeout = "2s"
+
+[http.cors]
+# Empty denies cross-origin browser access; ["*"] explicitly allows any origin.
+allowed_origins = []
+
+[http.rate_limit]
+enabled = true
+# Opt-in only: proxies must overwrite/append X-Forwarded-For correctly.
+# Example for a local proxy: ["127.0.0.1/32", "::1/128"].
+trusted_proxies = []
+
+[http.rate_limit.general]
+requests = 100
+period = "1s"
+burst = 200
+
+[http.rate_limit.auth]
+requests = 10
+period = "1m"
+burst = 10
+
+[realtime]
+ticket_ttl = "30s"
+outgoing_buffer = 32
+heartbeat_interval = "30s"
+heartbeat_timeout = "10s"
+session_recheck_interval = "30s"
+dispatch_concurrency = 32
+dispatch_timeout = "5s"
+
+[logging]
+filter = "info"
+format = "compact"

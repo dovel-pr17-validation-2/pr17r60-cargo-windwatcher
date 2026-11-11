@@ -1,0 +1,60 @@
+[package]
+name = "windwatcher-server"
+publish = ["crates-io"]
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Official self-hosted server for Windwatcher."
+readme = "README.md"
+keywords = ["messaging", "self-hosted", "server"]
+categories = ["network-programming"]
+
+[[bin]]
+name = "windwatcher"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["json", "query", "matched-path", "tokio", "ws", "http1"] }
+base64 = "0.23"
+rand_core = "0.10"
+getrandom = { version = "0.4", features = ["sys_rng", "std"] }
+sha2 = "0.11"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+governor = { version = "0.10", default-features = false, features = ["std", "dashmap"] }
+clap = { version = "4", features = ["derive"] }
+directories = "6"
+figment = { version = "0.10", features = ["env", "toml"] }
+humantime = "2"
+ipnet = { version = "2", default-features = false, features = ["std"] }
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+toml = "1.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+time = { version = "0.3", features = ["serde", "serde-well-known", "formatting", "parsing"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.7", features = ["cors", "trace", "sensitive-headers"] }
+utoipa = { version = "6", features = ["axum_extras", "time", "uuid"] }
+utoipa-axum = "0.3"
+utoipa-swagger-ui = { version = "10", default-features = false, features = ["axum", "vendored", "minified"] }
+uuid = { version = "1", features = ["v7"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+windwatcher = { path = "../windwatcher", version = "0.1.1", features = ["sqlite", "postgres", "mysql", "mongodb", "queue-sqlite", "queue-postgres", "queue-mysql", "queue-redis", "jwt-hs256"] }
+zeroize = { version = "1", features = ["serde"] }
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v7"] }
+tokio = { version = "1", features = ["test-util", "io-util"] }
+log = "0.4"
+tracing-log = "0.2"
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+tokio-tungstenite = "0.30"
+sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio"] }

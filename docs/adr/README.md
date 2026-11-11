@@ -1,0 +1,25 @@
+# Architectural Decision Records
+
+Architectural Decision Records (ADRs) capture significant architectural decisions
+made by this repository and the context behind them.
+
+Create an ADR when a change establishes or materially changes an architectural
+boundary, contract, or long-lived technical direction. Routine implementation
+choices and local refactors do not need one.
+
+ADRs use zero-padded sequential numbers and descriptive filenames, such as
+`0001-workspace-and-crate-boundaries.md`. Each ADR includes a status, normally
+`Proposed`, `Accepted`, or `Superseded`.
+
+ADRs document concrete decisions, not speculative roadmap architecture. An ADR
+should normally be introduced in the same change that implements its decision.
+When a decision is superseded, preserve the original ADR and mark it accordingly
+rather than silently rewriting history.
+
+Use [the template](0000-template.md) as a starting point.
+
+The durable queue contract is recorded in [ADR 0014](0014-durable-job-queue-semantics.md).
+MongoDB primary storage is recorded in [ADR 0015](0015-mongodb-primary-storage.md).
+Standalone runtime lifecycle is recorded in [ADR 0016](0016-standalone-runtime-lifecycle.md).
+Trusted proxy rate-limit addressing is recorded in [ADR 0017](0017-trusted-proxy-rate-limit-addresses.md).
+Static documentation publishing is recorded in [ADR 0018](0018-static-documentation-website.md).

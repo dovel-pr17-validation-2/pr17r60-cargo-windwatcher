@@ -1,0 +1,48 @@
+[package]
+name = "windwatcher"
+publish = ["crates-io"]
+version = "0.1.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Embeddable messaging engine for Rust applications."
+readme = "README.md"
+keywords = ["messaging", "embedded", "self-hosted"]
+categories = ["network-programming"]
+
+[features]
+default = []
+jwt-hs256 = ["dep:hmac"]
+sqlite = ["dep:sqlx", "sqlx/sqlite"]
+postgres = ["dep:sqlx", "sqlx/postgres", "sqlx/uuid", "sqlx/tls-rustls-ring"]
+mysql = ["dep:sqlx", "sqlx/mysql", "sqlx/tls-rustls-ring"]
+mongodb = ["dep:mongodb", "dep:futures-util"]
+queue-sqlite = ["dep:sqlx", "sqlx/sqlite", "dep:serde_stacker"]
+queue-postgres = ["dep:sqlx", "sqlx/postgres", "sqlx/uuid", "sqlx/tls-rustls-ring", "dep:serde_stacker"]
+queue-mysql = ["dep:sqlx", "sqlx/mysql", "sqlx/tls-rustls-ring", "dep:serde_stacker"]
+queue-redis = ["dep:redis", "dep:serde_stacker"]
+
+[dependencies]
+argon2 = { version = "0.6", features = ["zeroize"] }
+base64 = "0.23"
+hmac = { version = "0.13", optional = true }
+mongodb = { version = "3.9.1", optional = true, default-features = false, features = ["bson-3", "compat-3-3-0", "dns-resolver", "rustls-tls"] }
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["std"] }
+getrandom = { version = "0.4", features = ["sys_rng", "std"] }
+rand_core = "0.10"
+redis = { version = "1.8", optional = true, default-features = false, features = ["tokio-rustls-comp", "connection-manager", "script", "tls-rustls-webpki-roots"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["unbounded_depth"] }
+serde_stacker = { version = "0.1", optional = true }
+sha2 = "0.11"
+sqlx = { version = "0.9", optional = true, default-features = false, features = ["runtime-tokio", "migrate", "macros"] }
+thiserror = "2"
+time = "0.3"
+uuid = { version = "1", features = ["v7"] }
+zeroize = "1"
+
+[dev-dependencies]
+futures-executor = "0.3"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
